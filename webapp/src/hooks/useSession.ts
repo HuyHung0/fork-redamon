@@ -16,8 +16,9 @@ export function useSession() {
 
   // Initialize session on mount
   useEffect(() => {
-    // Generate a new session ID on app load/reload
-    const newSessionId = generateSessionId()
+    // Use environment variable if available, otherwise generate new session ID
+    const envSessionId = process.env.NEXT_PUBLIC_SESSION_ID
+    const newSessionId = envSessionId || generateSessionId()
     setSessionId(newSessionId)
     sessionStorage.setItem(SESSION_STORAGE_KEY, newSessionId)
     setMounted(true)

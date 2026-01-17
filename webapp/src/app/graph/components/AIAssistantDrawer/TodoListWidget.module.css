@@ -1,0 +1,84 @@
+.todoList {
+  display: flex;
+  flex-direction: column;
+  gap: 0.5rem;
+}
+
+.emptyState {
+  padding: 1rem;
+  text-align: center;
+}
+
+.emptyText {
+  font-size: 0.875rem;
+  color: var(--text-tertiary);
+  margin: 0;
+}
+
+.todoItem {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  padding: 0.625rem 0.875rem;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border-subtle);
+  border-radius: 6px;
+  transition: all 0.2s ease;
+}
+
+.todoItem:hover {
+  background: var(--bg-hover);
+  border-color: var(--border-primary);
+}
+
+.statusCompleted {
+  opacity: 0.6;
+}
+
+.statusCompleted .todoDescription {
+  text-decoration: line-through;
+}
+
+.todoIcon {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.iconCompleted {
+  color: var(--status-success);
+}
+
+.iconInProgress {
+  color: var(--accent-primary);
+}
+
+.iconPending {
+  color: var(--text-tertiary);
+}
+
+.spinner {
+  animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.todoContent {
+  flex: 1;
+  min-width: 0;
+}
+
+.todoDescription {
+  font-size: 0.875rem;
+  line-height: 1.4;
+  color: var(--text-primary);
+  word-wrap: break-word;
+}

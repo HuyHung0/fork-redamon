@@ -1187,6 +1187,264 @@ class AgentOrchestrator:
             question_request=state.get("pending_question"),
         )
 
+    # =========================================================================
+    # STREAMING API (WebSocket Support)
+    # =========================================================================
+
+    async def invoke_with_streaming(
+        self,
+        question: str,
+        user_id: str,
+        project_id: str,
+        session_id: str,
+        streaming_callback
+    ) -> InvokeResponse:
+        """
+        Invoke agent with streaming callbacks for real-time updates.
+
+        The streaming_callback should have methods:
+        - on_thinking(iteration, phase, thought, reasoning)
+        - on_tool_start(tool_name, tool_args)
+        - on_tool_output_chunk(tool_name, chunk, is_final)
+        - on_tool_complete(tool_name, success, output_summary)
+        - on_phase_update(current_phase, iteration_count)
+        - on_todo_update(todo_list)
+        - on_approval_request(approval_request)
+        - on_question_request(question_request)
+        - on_response(answer, iteration_count, phase, task_complete)
+        - on_execution_step(step)
+        - on_error(error_message, recoverable)
+        - on_task_complete(message, final_phase, total_iterations)
+        """
+        if not self._initialized:
+            raise RuntimeError("Orchestrator not initialized. Call initialize() first.")
+
+        logger.info(f"[{user_id}/{project_id}/{session_id}] Invoking with streaming: {question[:50]}...")
+
+        try:
+            config = create_config(user_id, project_id, session_id)
+            input_data = {
+                "messages": [HumanMessage(content=question)]
+            }
+
+            # Stream graph execution
+            final_state = None
+            async for event in self.graph.astream(input_data, config, stream_mode="values"):
+                final_state = event
+                await self._emit_streaming_events(event, streaming_callback)
+
+            if final_state:
+                # Send final response
+                response = self._build_response(final_state)
+                await streaming_callback.on_response(
+                    response.answer,
+                    response.iteration_count,
+                    response.current_phase,
+                    response.task_complete
+                )
+                return response
+            else:
+                raise RuntimeError("No final state returned from graph execution")
+
+        except Exception as e:
+            logger.error(f"[{user_id}/{project_id}/{session_id}] Streaming error: {e}")
+            await streaming_callback.on_error(str(e), recoverable=False)
+            return InvokeResponse(error=str(e))
+
+    async def resume_after_approval_with_streaming(
+        self,
+        session_id: str,
+        user_id: str,
+        project_id: str,
+        decision: str,
+        modification: Optional[str],
+        streaming_callback
+    ) -> InvokeResponse:
+        """Resume after approval with streaming callbacks."""
+        if not self._initialized:
+            raise RuntimeError("Orchestrator not initialized. Call initialize() first.")
+
+        logger.info(f"[{user_id}/{project_id}/{session_id}] Resuming with streaming approval: {decision}")
+
+        try:
+            config = create_config(user_id, project_id, session_id)
+
+            # Get current state
+            current_state = await self.graph.aget_state(config)
+            if not current_state or not current_state.values:
+                await streaming_callback.on_error("No pending session found", recoverable=False)
+                return InvokeResponse(error="No pending session found")
+
+            # Update with approval
+            update_data = {
+                "user_approval_response": decision,
+                "user_modification": modification,
+            }
+
+            # Stream execution
+            final_state = None
+            async for event in self.graph.astream(update_data, config, stream_mode="values"):
+                final_state = event
+                await self._emit_streaming_events(event, streaming_callback)
+
+            if final_state:
+                response = self._build_response(final_state)
+                await streaming_callback.on_response(
+                    response.answer,
+                    response.iteration_count,
+                    response.current_phase,
+                    response.task_complete
+                )
+                return response
+            else:
+                raise RuntimeError("No final state returned")
+
+        except Exception as e:
+            logger.error(f"[{user_id}/{project_id}/{session_id}] Resume streaming error: {e}")
+            await streaming_callback.on_error(str(e), recoverable=False)
+            return InvokeResponse(error=str(e))
+
+    async def resume_after_answer_with_streaming(
+        self,
+        session_id: str,
+        user_id: str,
+        project_id: str,
+        answer: str,
+        streaming_callback
+    ) -> InvokeResponse:
+        """Resume after answer with streaming callbacks."""
+        if not self._initialized:
+            raise RuntimeError("Orchestrator not initialized. Call initialize() first.")
+
+        logger.info(f"[{user_id}/{project_id}/{session_id}] Resuming with streaming answer: {answer[:50]}...")
+
+        try:
+            config = create_config(user_id, project_id, session_id)
+
+            # Get current state
+            current_state = await self.graph.aget_state(config)
+            if not current_state or not current_state.values:
+                await streaming_callback.on_error("No pending session found", recoverable=False)
+                return InvokeResponse(error="No pending session found")
+
+            # Update with answer
+            update_data = {
+                "user_question_answer": answer,
+            }
+
+            # Stream execution
+            final_state = None
+            async for event in self.graph.astream(update_data, config, stream_mode="values"):
+                final_state = event
+                await self._emit_streaming_events(event, streaming_callback)
+
+            if final_state:
+                response = self._build_response(final_state)
+                await streaming_callback.on_response(
+                    response.answer,
+                    response.iteration_count,
+                    response.current_phase,
+                    response.task_complete
+                )
+                return response
+            else:
+                raise RuntimeError("No final state returned")
+
+        except Exception as e:
+            logger.error(f"[{user_id}/{project_id}/{session_id}] Resume streaming error: {e}")
+            await streaming_callback.on_error(str(e), recoverable=False)
+            return InvokeResponse(error=str(e))
+
+    async def _emit_streaming_events(self, state: dict, callback):
+        """Emit appropriate streaming events based on state changes."""
+        try:
+            # Phase update
+            if "current_phase" in state:
+                await callback.on_phase_update(
+                    state.get("current_phase", "informational"),
+                    state.get("current_iteration", 0)
+                )
+
+            # Todo list update
+            if "todo_list" in state and state.get("todo_list"):
+                await callback.on_todo_update(state["todo_list"])
+
+            # Approval request
+            if state.get("awaiting_user_approval") and state.get("phase_transition_pending"):
+                await callback.on_approval_request(state["phase_transition_pending"])
+
+            # Question request
+            if state.get("awaiting_user_question") and state.get("pending_question"):
+                await callback.on_question_request(state["pending_question"])
+
+            # Execution step (from _current_step)
+            if "_current_step" in state and state["_current_step"]:
+                step = state["_current_step"]
+                # Emit tool start
+                if step.get("tool_name") and not step.get("_emitted_start"):
+                    await callback.on_tool_start(
+                        step["tool_name"],
+                        step.get("tool_args", {})
+                    )
+                    step["_emitted_start"] = True
+
+                # Emit tool output chunk
+                if step.get("tool_output"):
+                    await callback.on_tool_output_chunk(
+                        step.get("tool_name", "unknown"),
+                        step["tool_output"],
+                        is_final=True
+                    )
+
+                # Emit tool complete
+                if step.get("success") is not None and not step.get("_emitted_complete"):
+                    await callback.on_tool_complete(
+                        step.get("tool_name", "unknown"),
+                        step["success"],
+                        step.get("output_analysis", "")[:500]
+                    )
+                    step["_emitted_complete"] = True
+
+                # Emit execution step summary
+                await callback.on_execution_step({
+                    "iteration": step.get("iteration", 0),
+                    "phase": state.get("current_phase", "informational"),
+                    "thought": step.get("thought", ""),
+                    "tool_name": step.get("tool_name"),
+                    "success": step.get("success", False),
+                    "output_summary": step.get("output_analysis", "")[:200]
+                })
+
+            # Emit thinking (from _decision stored by _think_node)
+            if "_decision" in state and state["_decision"]:
+                decision = state["_decision"]
+                # Only emit if we haven't emitted this decision yet
+                if decision.get("thought") and not decision.get("_emitted_thinking"):
+                    try:
+                        await callback.on_thinking(
+                            state.get("current_iteration", 0),
+                            state.get("current_phase", "informational"),
+                            decision.get("thought", ""),
+                            decision.get("reasoning", "")
+                        )
+                        # Mark as emitted to avoid duplicates
+                        decision["_emitted_thinking"] = True
+                    except Exception as e:
+                        logger.error(f"Error emitting thinking event: {e}")
+
+            # Task complete
+            if state.get("task_complete"):
+                await callback.on_task_complete(
+                    "Task completed successfully",
+                    state.get("current_phase", "informational"),
+                    state.get("current_iteration", 0)
+                )
+
+        except Exception as e:
+            logger.error(f"Error emitting streaming events: {e}")
+            # Don't fail the whole operation if streaming fails
+            pass
+
     async def close(self) -> None:
         """Clean up resources."""
         self._initialized = False

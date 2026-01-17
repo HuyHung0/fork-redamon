@@ -161,8 +161,9 @@ This is ideal for proof-of-concept demonstrations and vulnerability validation.
 - Capture the command output as proof of exploitation
 - Document: "Vulnerability CVE-XXXX-XXXXX confirmed exploitable on [target]"
 - No session management needed
-- Exploitation phase is complete after successful PoC
+- **IMMEDIATELY use action="complete" after successful PoC** - DO NOT verify or troubleshoot further
 - Do NOT transition to post_exploitation phase (no session exists)
+- Trust the command output - if it shows success (no errors), the objective is achieved
 """
 
 POST_EXPLOITATION_TOOLS = """
@@ -374,6 +375,33 @@ Based on the context above, decide your next action. You MUST output valid JSON:
 - **transition_phase**: Request phase change. Include phase_transition object.
 - **complete**: Task is finished. Include completion_reason.
 - **ask_user**: Ask user for clarification. Include user_question object.
+
+### When to Use action="complete" (CRITICAL - Read Carefully!):
+
+Use `action="complete"` when the **user's original objective has been achieved**. Stop immediately when the goal is reached.
+
+**Exploitation Completion Triggers:**
+- PoC Mode: After successfully executing the exploit and capturing command output as proof
+- Defacement: After successfully modifying the target file/page (e.g., "Site hacked!" written)
+- RCE: After successfully executing the requested command and capturing output
+- Session Mode: After successfully establishing a Meterpreter/shell session (then transition to post_exploitation)
+
+**DO NOT continue with additional tasks unless the user explicitly requests them:**
+- Do NOT verify/re-check if the exploit already succeeded (output shows success)
+- Do NOT troubleshoot or diagnose if the objective was achieved
+- Do NOT run additional reconnaissance after successful exploitation
+- Do NOT perform additional post-exploitation without user request
+
+**Example - When to STOP:**
+User asks: "Exploit CVE-2021-42013 and deface the website"
+- After running exploit command that writes "Site hacked!" → action="complete"
+- DO NOT verify by curling the page afterward (unless verification failed in the same command)
+- DO NOT read the file again to confirm
+- DO NOT check user permissions after success
+
+**Verification is BUILT-IN:**
+- If the exploit command output shows success (no errors, command executed) → Trust it and complete
+- Only verify if the output is unclear or shows errors
 
 ### Tool Arguments:
 - query_graph: {{"question": "natural language question about the graph data"}}

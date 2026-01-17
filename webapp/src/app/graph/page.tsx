@@ -12,7 +12,10 @@ import config from '@/config.json'
 import styles from './page.module.css'
 
 export default function GraphPage() {
-  const { user_id: userId, project_id: projectId } = config
+  // Use environment variables as primary source, fallback to config.json
+  const userId = process.env.NEXT_PUBLIC_USER_ID || config.user_id
+  const projectId = process.env.NEXT_PUBLIC_PROJECT_ID || config.project_id
+
   const [is3D, setIs3D] = useState(true)
   const [showLabels, setShowLabels] = useState(false)
   const [isAIOpen, setIsAIOpen] = useState(false)
