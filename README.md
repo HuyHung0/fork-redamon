@@ -450,6 +450,15 @@ stateDiagram-v2
 
     Reasoning --> AskQuestion: Need Clarification?
     AskQuestion --> Reasoning: User Response
+
+    state "User Guidance" as Guidance
+    Reasoning --> Guidance: User sends guidance
+    Guidance --> Reasoning: Injected in next think step
+
+    state "Stopped" as Stopped
+    Reasoning --> Stopped: User clicks Stop
+    ToolExecution --> Stopped: User clicks Stop
+    Stopped --> Reasoning: User clicks Resume
 ```
 
 ### Graph Database Schema
@@ -590,6 +599,8 @@ LangGraph-based autonomous agent with ReAct pattern.
 - **Phase-Aware Execution**: Human approval for dangerous operations
 - **Memory Persistence**: Conversation history via MemorySaver
 - **Multi-Objective Support**: Complex attack chain planning
+- **Live Guidance**: Send steering messages to the agent while it works
+- **Stop & Resume**: Interrupt execution and resume from the last checkpoint
 
 📖 **[Read Agentic Documentation](agentic/README.AGENTIC.md)**
 📖 **[Metasploit Integration Guide](agentic/README.METASPLOIT.GUIDE.md)**

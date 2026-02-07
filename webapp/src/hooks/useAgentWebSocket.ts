@@ -43,6 +43,9 @@ interface UseAgentWebSocketReturn {
   sendQuery: (question: string) => void
   sendApproval: (decision: 'approve' | 'modify' | 'abort', modification?: string) => void
   sendAnswer: (answer: string) => void
+  sendGuidance: (message: string) => void
+  sendStop: () => void
+  sendResume: () => void
   disconnect: () => void
   reconnect: () => void
 }
@@ -132,6 +135,24 @@ export function useAgentWebSocket({
 
     const answerPayload: AnswerPayload = { answer }
     sendMessage(MessageType.ANSWER, answerPayload)
+  }, [sendMessage])
+
+  // Public API: Send guidance (steer agent while it's working)
+  const sendGuidance = useCallback((message: string) => {
+    if (!isAuthenticatedRef.current) return
+    sendMessage(MessageType.GUIDANCE, { message })
+  }, [sendMessage])
+
+  // Public API: Stop agent execution
+  const sendStop = useCallback(() => {
+    if (!isAuthenticatedRef.current) return
+    sendMessage(MessageType.STOP, {})
+  }, [sendMessage])
+
+  // Public API: Resume agent execution from checkpoint
+  const sendResume = useCallback(() => {
+    if (!isAuthenticatedRef.current) return
+    sendMessage(MessageType.RESUME, {})
   }, [sendMessage])
 
   // Start ping interval for keep-alive
@@ -318,6 +339,9 @@ export function useAgentWebSocket({
     sendQuery,
     sendApproval,
     sendAnswer,
+    sendGuidance,
+    sendStop,
+    sendResume,
     disconnect,
     reconnect,
   }

@@ -14,6 +14,7 @@ from enum import Enum
 
 from fastapi import WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, ValidationError
+from orchestrator_helpers import create_config
 
 
 def serialize_for_json(obj):
@@ -41,6 +42,9 @@ class MessageType(str, Enum):
     APPROVAL = "approval"
     ANSWER = "answer"
     PING = "ping"
+    GUIDANCE = "guidance"
+    STOP = "stop"
+    RESUME = "resume"
 
     # Server → Client
     CONNECTED = "connected"
@@ -58,6 +62,8 @@ class MessageType(str, Enum):
     ERROR = "error"
     PONG = "pong"
     TASK_COMPLETE = "task_complete"
+    GUIDANCE_ACK = "guidance_ack"
+    STOPPED = "stopped"
 
 
 # =============================================================================
@@ -87,6 +93,11 @@ class AnswerMessage(BaseModel):
     answer: str
 
 
+class GuidanceMessage(BaseModel):
+    """Send guidance to steer agent while it's working"""
+    message: str
+
+
 # =============================================================================
 # WEBSOCKET CONNECTION MANAGER
 # =============================================================================
@@ -102,6 +113,9 @@ class WebSocketConnection:
         self.authenticated = False
         self.connected_at = datetime.utcnow()
         self.last_ping = datetime.utcnow()
+        self.guidance_queue: asyncio.Queue = asyncio.Queue()
+        self._active_task: Optional[Any] = None
+        self._is_stopped: bool = False
 
     async def send_message(self, message_type: MessageType, payload: Any):
         """Send JSON message to client"""
@@ -118,6 +132,16 @@ class WebSocketConnection:
         except Exception as e:
             logger.error(f"Error sending message: {e}")
             raise
+
+    def drain_guidance(self) -> list:
+        """Drain all pending guidance messages from the queue (non-blocking)."""
+        messages = []
+        while not self.guidance_queue.empty():
+            try:
+                messages.append(self.guidance_queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        return messages
 
     def get_key(self) -> Optional[str]:
         """Get unique key for this connection"""
@@ -352,7 +376,7 @@ class WebSocketHandler:
             })
 
     async def handle_query(self, connection: WebSocketConnection, payload: dict):
-        """Handle user query"""
+        """Handle user query — launches orchestrator as background task"""
         try:
             query_msg = QueryMessage(**payload)
 
@@ -365,21 +389,17 @@ class WebSocketHandler:
 
             # Create streaming callback
             callback = StreamingCallback(connection)
+            connection._is_stopped = False
+            # Drain stale guidance from previous runs
+            connection.drain_guidance()
 
-            # Execute query with streaming
             logger.info(f"Processing query for session {connection.session_id}: {query_msg.question[:50]}...")
 
-            # Call orchestrator with streaming callback
-            # This will be implemented in Phase 2
-            result = await self.orchestrator.invoke_with_streaming(
-                question=query_msg.question,
-                user_id=connection.user_id,
-                project_id=connection.project_id,
-                session_id=connection.session_id,
-                streaming_callback=callback
+            # Run orchestrator as background task so receive loop stays free
+            task = asyncio.create_task(
+                self._run_orchestrator_query(connection, query_msg.question, callback)
             )
-
-            logger.info(f"Query completed for session {connection.session_id}")
+            connection._active_task = task
 
         except ValidationError as e:
             logger.error(f"Invalid query message: {e}")
@@ -387,15 +407,35 @@ class WebSocketHandler:
                 "message": "Invalid query format",
                 "recoverable": True
             })
+
+    async def _run_orchestrator_query(self, connection: WebSocketConnection, question: str, callback):
+        """Background coroutine that runs the orchestrator invocation."""
+        try:
+            result = await self.orchestrator.invoke_with_streaming(
+                question=question,
+                user_id=connection.user_id,
+                project_id=connection.project_id,
+                session_id=connection.session_id,
+                streaming_callback=callback,
+                guidance_queue=connection.guidance_queue,
+            )
+            logger.info(f"Query completed for session {connection.session_id}")
+        except asyncio.CancelledError:
+            logger.info(f"Query task cancelled for session {connection.session_id}")
         except Exception as e:
             logger.error(f"Error processing query: {e}")
-            await connection.send_message(MessageType.ERROR, {
-                "message": f"Error processing query: {str(e)}",
-                "recoverable": True
-            })
+            try:
+                await connection.send_message(MessageType.ERROR, {
+                    "message": f"Error processing query: {str(e)}",
+                    "recoverable": True
+                })
+            except Exception:
+                pass
+        finally:
+            connection._active_task = None
 
     async def handle_approval(self, connection: WebSocketConnection, payload: dict):
-        """Handle approval response"""
+        """Handle approval response — launches as background task"""
         try:
             approval_msg = ApprovalMessage(**payload)
 
@@ -406,22 +446,15 @@ class WebSocketHandler:
                 })
                 return
 
-            # Create streaming callback
             callback = StreamingCallback(connection)
+            connection._is_stopped = False
 
-            # Resume orchestrator after approval
             logger.info(f"Processing approval for session {connection.session_id}: {approval_msg.decision}")
 
-            result = await self.orchestrator.resume_after_approval_with_streaming(
-                session_id=connection.session_id,
-                user_id=connection.user_id,
-                project_id=connection.project_id,
-                decision=approval_msg.decision,
-                modification=approval_msg.modification,
-                streaming_callback=callback
+            task = asyncio.create_task(
+                self._run_orchestrator_approval(connection, approval_msg, callback)
             )
-
-            logger.info(f"Approval processed for session {connection.session_id}")
+            connection._active_task = task
 
         except ValidationError as e:
             logger.error(f"Invalid approval message: {e}")
@@ -429,15 +462,36 @@ class WebSocketHandler:
                 "message": "Invalid approval format",
                 "recoverable": True
             })
+
+    async def _run_orchestrator_approval(self, connection: WebSocketConnection, approval_msg: ApprovalMessage, callback):
+        """Background coroutine that runs approval resumption."""
+        try:
+            result = await self.orchestrator.resume_after_approval_with_streaming(
+                session_id=connection.session_id,
+                user_id=connection.user_id,
+                project_id=connection.project_id,
+                decision=approval_msg.decision,
+                modification=approval_msg.modification,
+                streaming_callback=callback,
+                guidance_queue=connection.guidance_queue,
+            )
+            logger.info(f"Approval processed for session {connection.session_id}")
+        except asyncio.CancelledError:
+            logger.info(f"Approval task cancelled for session {connection.session_id}")
         except Exception as e:
             logger.error(f"Error processing approval: {e}")
-            await connection.send_message(MessageType.ERROR, {
-                "message": f"Error processing approval: {str(e)}",
-                "recoverable": True
-            })
+            try:
+                await connection.send_message(MessageType.ERROR, {
+                    "message": f"Error processing approval: {str(e)}",
+                    "recoverable": True
+                })
+            except Exception:
+                pass
+        finally:
+            connection._active_task = None
 
     async def handle_answer(self, connection: WebSocketConnection, payload: dict):
-        """Handle answer to agent question"""
+        """Handle answer to agent question — launches as background task"""
         try:
             answer_msg = AnswerMessage(**payload)
 
@@ -448,21 +502,15 @@ class WebSocketHandler:
                 })
                 return
 
-            # Create streaming callback
             callback = StreamingCallback(connection)
+            connection._is_stopped = False
 
-            # Resume orchestrator after answer
             logger.info(f"Processing answer for session {connection.session_id}")
 
-            result = await self.orchestrator.resume_after_answer_with_streaming(
-                session_id=connection.session_id,
-                user_id=connection.user_id,
-                project_id=connection.project_id,
-                answer=answer_msg.answer,
-                streaming_callback=callback
+            task = asyncio.create_task(
+                self._run_orchestrator_answer(connection, answer_msg.answer, callback)
             )
-
-            logger.info(f"Answer processed for session {connection.session_id}")
+            connection._active_task = task
 
         except ValidationError as e:
             logger.error(f"Invalid answer message: {e}")
@@ -470,12 +518,146 @@ class WebSocketHandler:
                 "message": "Invalid answer format",
                 "recoverable": True
             })
+
+    async def _run_orchestrator_answer(self, connection: WebSocketConnection, answer: str, callback):
+        """Background coroutine that runs answer resumption."""
+        try:
+            result = await self.orchestrator.resume_after_answer_with_streaming(
+                session_id=connection.session_id,
+                user_id=connection.user_id,
+                project_id=connection.project_id,
+                answer=answer,
+                streaming_callback=callback,
+                guidance_queue=connection.guidance_queue,
+            )
+            logger.info(f"Answer processed for session {connection.session_id}")
+        except asyncio.CancelledError:
+            logger.info(f"Answer task cancelled for session {connection.session_id}")
         except Exception as e:
             logger.error(f"Error processing answer: {e}")
+            try:
+                await connection.send_message(MessageType.ERROR, {
+                    "message": f"Error processing answer: {str(e)}",
+                    "recoverable": True
+                })
+            except Exception:
+                pass
+        finally:
+            connection._active_task = None
+
+    async def handle_guidance(self, connection: WebSocketConnection, payload: dict):
+        """Handle guidance message while agent is executing."""
+        try:
+            guidance_msg = GuidanceMessage(**payload)
+
+            if not connection.authenticated:
+                await connection.send_message(MessageType.ERROR, {
+                    "message": "Not authenticated",
+                    "recoverable": False
+                })
+                return
+
+            await connection.guidance_queue.put(guidance_msg.message)
+            queue_size = connection.guidance_queue.qsize()
+
+            await connection.send_message(MessageType.GUIDANCE_ACK, {
+                "message": guidance_msg.message,
+                "queue_position": queue_size,
+            })
+
+            logger.info(f"Guidance queued for session {connection.session_id}: {guidance_msg.message[:100]}...")
+
+        except ValidationError as e:
+            logger.error(f"Invalid guidance message: {e}")
             await connection.send_message(MessageType.ERROR, {
-                "message": f"Error processing answer: {str(e)}",
+                "message": "Invalid guidance format",
                 "recoverable": True
             })
+
+    async def handle_stop(self, connection: WebSocketConnection, payload: dict):
+        """Handle stop request — cancels active agent execution."""
+        if not connection.authenticated:
+            await connection.send_message(MessageType.ERROR, {
+                "message": "Not authenticated",
+                "recoverable": False
+            })
+            return
+
+        if connection._active_task and not connection._active_task.done():
+            connection._active_task.cancel()
+            connection._is_stopped = True
+
+            # Get current state for the STOPPED message
+            try:
+                config = create_config(connection.user_id, connection.project_id, connection.session_id)
+                current_state = await self.orchestrator.graph.aget_state(config)
+                iteration = current_state.values.get("current_iteration", 0) if current_state and current_state.values else 0
+                phase = current_state.values.get("current_phase", "informational") if current_state and current_state.values else "informational"
+            except Exception:
+                iteration = 0
+                phase = "informational"
+
+            await connection.send_message(MessageType.STOPPED, {
+                "message": "Agent execution stopped",
+                "iteration": iteration,
+                "phase": phase,
+            })
+            logger.info(f"Execution stopped for session {connection.session_id}")
+        else:
+            await connection.send_message(MessageType.ERROR, {
+                "message": "No active execution to stop",
+                "recoverable": True,
+            })
+
+    async def handle_resume(self, connection: WebSocketConnection, payload: dict):
+        """Handle resume request — restarts agent from last checkpoint."""
+        if not connection.authenticated:
+            await connection.send_message(MessageType.ERROR, {
+                "message": "Not authenticated",
+                "recoverable": False
+            })
+            return
+
+        if not connection._is_stopped:
+            await connection.send_message(MessageType.ERROR, {
+                "message": "No stopped execution to resume",
+                "recoverable": True,
+            })
+            return
+
+        connection._is_stopped = False
+        callback = StreamingCallback(connection)
+
+        task = asyncio.create_task(
+            self._run_orchestrator_resume(connection, callback)
+        )
+        connection._active_task = task
+        logger.info(f"Resuming execution for session {connection.session_id}")
+
+    async def _run_orchestrator_resume(self, connection: WebSocketConnection, callback):
+        """Background coroutine that resumes orchestrator from checkpoint."""
+        try:
+            result = await self.orchestrator.resume_execution_with_streaming(
+                user_id=connection.user_id,
+                project_id=connection.project_id,
+                session_id=connection.session_id,
+                streaming_callback=callback,
+                guidance_queue=connection.guidance_queue,
+            )
+            logger.info(f"Resumed execution completed for session {connection.session_id}")
+        except asyncio.CancelledError:
+            logger.info(f"Resumed task cancelled for session {connection.session_id}")
+        except Exception as e:
+            logger.error(f"Error resuming execution: {e}")
+            try:
+                await connection.send_message(MessageType.ERROR, {
+                    "message": f"Error resuming execution: {str(e)}",
+                    "recoverable": True
+                })
+            except Exception:
+                pass
+        finally:
+            connection._active_task = None
 
     async def handle_ping(self, connection: WebSocketConnection, payload: dict):
         """Handle ping for keep-alive"""
@@ -500,6 +682,12 @@ class WebSocketHandler:
                 await self.handle_answer(connection, payload)
             elif msg_type == MessageType.PING:
                 await self.handle_ping(connection, payload)
+            elif msg_type == MessageType.GUIDANCE:
+                await self.handle_guidance(connection, payload)
+            elif msg_type == MessageType.STOP:
+                await self.handle_stop(connection, payload)
+            elif msg_type == MessageType.RESUME:
+                await self.handle_resume(connection, payload)
             else:
                 logger.warning(f"Unknown message type: {msg_type}")
                 await connection.send_message(MessageType.ERROR, {
@@ -573,4 +761,6 @@ async def websocket_endpoint(
         except:
             pass
     finally:
+        if connection._active_task and not connection._active_task.done():
+            connection._active_task.cancel()
         await ws_manager.disconnect(connection)

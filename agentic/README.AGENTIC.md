@@ -14,6 +14,8 @@ The **RedAmon Agentic System** is an AI-powered penetration testing orchestrator
 4. [Attack Path Classification](#attack-path-classification)
 5. [Tool Execution & MCP Integration](#tool-execution--mcp-integration)
 6. [WebSocket Streaming](#websocket-streaming)
+   - [Guidance Messages](#guidance-messages)
+   - [Stop & Resume Execution](#stop--resume-execution)
 7. [Frontend Integration](#frontend-integration)
 8. [Detailed Workflows](#detailed-workflows)
 9. [Multi-Objective Support](#multi-objective-support)
@@ -119,13 +121,15 @@ classDiagram
         +llm: ChatOpenAI
         +tool_executor: PhaseAwareToolExecutor
         +graph: StateGraph
+        +_guidance_queue: asyncio.Queue
         +initialize()
         +invoke(question, user_id, project_id, session_id)
-        +invoke_with_streaming(question, ..., streaming_callback)
+        +invoke_with_streaming(question, ..., streaming_callback, guidance_queue)
         +resume_after_approval(...)
         +resume_after_answer(...)
-        +resume_after_approval_with_streaming(...)
-        +resume_after_answer_with_streaming(...)
+        +resume_after_approval_with_streaming(..., guidance_queue)
+        +resume_after_answer_with_streaming(..., guidance_queue)
+        +resume_execution_with_streaming(..., guidance_queue)
     }
 
     class PhaseAwareToolExecutor {
@@ -570,6 +574,9 @@ flowchart LR
         QUERY[query<br/>{question}]
         APPROVAL[approval<br/>{decision, modification}]
         ANSWER[answer<br/>{answer}]
+        GUIDANCE[guidance<br/>{message}]
+        STOP[stop<br/>{}]
+        RESUME[resume<br/>{}]
         PING[ping<br/>{}]
     end
 
@@ -586,6 +593,8 @@ flowchart LR
         RESPONSE[response<br/>{answer, task_complete}]
         EXEC_STEP[execution_step<br/>{step summary}]
         TASK_DONE[task_complete<br/>{message, final_phase}]
+        GUIDANCE_ACK[guidance_ack<br/>{message, queue_position}]
+        STOPPED[stopped<br/>{message, iteration, phase}]
         ERROR[error<br/>{message, recoverable}]
     end
 ```
@@ -643,6 +652,83 @@ sequenceDiagram
     CB-->>WS-->>C: task_complete
 ```
 
+### Guidance Messages
+
+Users can send **guidance messages** while the agent is working (thinking or executing tools). These messages steer/correct the agent's current objective without creating new tasks.
+
+```mermaid
+sequenceDiagram
+    participant U as User (Frontend)
+    participant WS as WebSocket API
+    participant Q as Connection.guidance_queue
+    participant O as Orchestrator (_think_node)
+
+    Note over O: Agent is working (think → execute → think loop)
+
+    U->>WS: guidance {message: "Focus on port 22"}
+    WS->>Q: guidance_queue.put("Focus on port 22")
+    WS-->>U: guidance_ack {message, queue_position: 1}
+
+    U->>WS: guidance {message: "Skip the web server"}
+    WS->>Q: guidance_queue.put("Skip the web server")
+    WS-->>U: guidance_ack {message, queue_position: 2}
+
+    Note over O: Next think node runs...
+    O->>Q: drain_guidance() → ["Focus on port 22", "Skip the web server"]
+    O->>O: Inject into system prompt as<br/>## USER GUIDANCE (IMPORTANT)
+    O->>O: LLM acknowledges guidance in thought
+```
+
+**How it works:**
+
+1. **Frontend**: When `isLoading=true`, the chat input stays enabled. Sending a message routes to `sendGuidance()` instead of `sendQuery()`.
+2. **WebSocket API**: `handle_guidance` puts the message into the connection's `asyncio.Queue` and sends back a `guidance_ack` with the queue position.
+3. **Orchestrator**: At the start of each `_think_node` invocation, pending guidance messages are drained from the queue and injected into the system prompt as a numbered `## USER GUIDANCE` section.
+4. **LLM**: The agent sees the guidance and adjusts its plan accordingly in the next decision.
+
+**Edge cases:**
+- Multiple guidance messages before the next think step are all collected and injected as a numbered list
+- Guidance sent during tool execution is queued and consumed in the next think step
+- Stale guidance from previous queries is drained at the start of each new `handle_query`
+
+### Stop & Resume Execution
+
+Users can **stop** the agent mid-execution and **resume** from the last LangGraph checkpoint.
+
+```mermaid
+sequenceDiagram
+    participant U as User (Frontend)
+    participant WS as WebSocket API
+    participant T as asyncio.Task
+    participant CP as MemorySaver Checkpoint
+
+    Note over T: Agent task running (background asyncio.Task)
+
+    U->>WS: stop {}
+    WS->>T: task.cancel()
+    T->>T: CancelledError raised
+    Note over CP: State checkpointed at last node boundary
+    WS->>WS: Read iteration/phase from checkpoint
+    WS-->>U: stopped {message, iteration: 5, phase: "exploitation"}
+
+    Note over U: UI shows resume button (green play icon)
+
+    U->>WS: resume {}
+    WS->>WS: Create new background task
+    WS->>T: orchestrator.resume_execution_with_streaming()
+    T->>CP: graph.astream({}, config) — resume from checkpoint
+    Note over T: Agent continues from last node boundary
+
+    T-->>WS-->>U: thinking, tool_start, ... (normal streaming)
+```
+
+**How it works:**
+
+1. **Background tasks**: All orchestrator invocations (`handle_query`, `handle_approval`, `handle_answer`) run as `asyncio.create_task()` background tasks, keeping the WebSocket receive loop free for guidance/stop/resume messages.
+2. **Stop**: Cancels the active `asyncio.Task`. The `CancelledError` is caught gracefully. LangGraph's `MemorySaver` has already checkpointed state at the last node boundary.
+3. **Resume**: Calls `resume_execution_with_streaming()` which re-invokes `graph.astream({}, config)` with empty input. The graph resumes from the checkpoint, re-entering `initialize → think` with the preserved state.
+4. **Frontend**: The stop button (red square) appears during loading. After stop, it becomes a resume button (green play). The input is disabled while stopped.
+
 ---
 
 ## Frontend Integration
@@ -674,6 +760,8 @@ flowchart TB
     subgraph State["AIAssistantDrawer State"]
         ITEMS[chatItems: Array]
         PHASE[currentPhase: string]
+        LOADING[isLoading: boolean]
+        STOPPED[isStopped: boolean]
         AWAIT_A[awaitingApproval: boolean]
         AWAIT_Q[awaitingQuestion: boolean]
         TODO[todoList: Array]
@@ -687,6 +775,8 @@ flowchart TB
         E_APPR[approval_request]
         E_QUES[question_request]
         E_RESP[response]
+        E_GACK[guidance_ack]
+        E_STOP[stopped]
     end
 
     subgraph UI["UI Components"]
@@ -695,6 +785,8 @@ flowchart TB
         DIALOG_Q[QuestionDialog]
         TODO_W[TodoListWidget]
         CHAT[ChatMessages]
+        STOP_BTN[Stop/Resume Button]
+        GUIDANCE_INPUT[Guidance Input<br/>enabled during loading]
     end
 
     E_THINK --> |Add ThinkingItem| ITEMS
@@ -704,6 +796,7 @@ flowchart TB
     E_TODO --> TODO
     E_APPR --> AWAIT_A
     E_QUES --> AWAIT_Q
+    E_STOP --> STOPPED
 
     ITEMS --> TIMELINE
     ITEMS --> CHAT
@@ -711,7 +804,25 @@ flowchart TB
     AWAIT_Q --> DIALOG_Q
     TODO --> TODO_W
     PHASE --> |Phase badge styling| TIMELINE
+    LOADING --> STOP_BTN
+    STOPPED --> STOP_BTN
+    LOADING --> GUIDANCE_INPUT
 ```
+
+### Input Mode Behavior
+
+The chat input adapts based on agent state:
+
+| State | Input Enabled | Send Action | Placeholder | Extra Button |
+|-------|--------------|-------------|-------------|--------------|
+| **Idle** | Yes | `sendQuery()` | "Ask a question..." | None |
+| **Loading** (agent working) | Yes | `sendGuidance()` | "Send guidance to the agent..." | Stop (red square) |
+| **Stopped** | No | — | "Agent stopped. Click resume..." | Resume (green play) |
+| **Awaiting approval** | No | — | "Respond to the approval request..." | None |
+| **Awaiting question** | No | — | "Answer the question above..." | None |
+| **Disconnected** | No | — | "Connecting to agent..." | None |
+
+Guidance messages appear in the chat with a purple "Guidance" badge and dashed border styling to distinguish them from regular user messages.
 
 ---
 
@@ -1295,21 +1406,31 @@ const ws = new WebSocket('ws://localhost:8080/ws');
 // Authenticate
 ws.send(JSON.stringify({
   type: 'init',
-  user_id: 'user123',
-  project_id: 'proj456',
-  session_id: 'sess789'
+  payload: { user_id: 'user123', project_id: 'proj456', session_id: 'sess789' }
 }));
 
 // Send query
 ws.send(JSON.stringify({
   type: 'query',
-  question: 'Scan ports on 192.168.1.1'
+  payload: { question: 'Scan ports on 192.168.1.1' }
 }));
+
+// Send guidance while agent is working
+ws.send(JSON.stringify({
+  type: 'guidance',
+  payload: { message: 'Focus on port 22 first' }
+}));
+
+// Stop agent execution
+ws.send(JSON.stringify({ type: 'stop', payload: {} }));
+
+// Resume from last checkpoint
+ws.send(JSON.stringify({ type: 'resume', payload: {} }));
 
 // Handle responses
 ws.onmessage = (event) => {
   const msg = JSON.parse(event.data);
-  console.log(msg.type, msg);
+  console.log(msg.type, msg.payload);
 };
 ```
 
@@ -1324,8 +1445,10 @@ The RedAmon Agentic System provides:
 3. **Attack Path Classification** - LLM-based classification of objectives into CVE exploit or brute force paths, with dynamic tool routing
 4. **Human Oversight** - Approval workflows for risky phase transitions and pre-exploitation validation
 5. **Real-Time Feedback** - WebSocket streaming with progress chunks for long-running commands
-6. **Multi-Tenancy** - Isolated sessions with tenant-filtered data access
-7. **Stateful Exploitation** - Persistent Metasploit sessions with auto-reset and session/credential detection
-8. **Multi-Objective Support** - Continuous conversations with context preservation and per-objective attack path classification
-9. **Database-Driven Configuration** - All settings fetched from PostgreSQL via webapp API, with standalone defaults fallback
-10. **Custom Phase Prompts** - Per-phase system prompt injection for project-specific agent behavior
+6. **Live Guidance** - Send steering messages while the agent works, injected into the next think step
+7. **Stop & Resume** - Interrupt agent execution and resume from the last LangGraph checkpoint
+8. **Multi-Tenancy** - Isolated sessions with tenant-filtered data access
+9. **Stateful Exploitation** - Persistent Metasploit sessions with auto-reset and session/credential detection
+10. **Multi-Objective Support** - Continuous conversations with context preservation and per-objective attack path classification
+11. **Database-Driven Configuration** - All settings fetched from PostgreSQL via webapp API, with standalone defaults fallback
+12. **Custom Phase Prompts** - Per-phase system prompt injection for project-specific agent behavior

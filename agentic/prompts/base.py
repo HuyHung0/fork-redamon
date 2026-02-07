@@ -802,6 +802,25 @@ Each node has `user_id` and `project_id` properties for tenant isolation (handle
 - id (string): "CAPEC-86"
 - name (string)
 
+### Exploitation Nodes
+
+**Exploit** - Successful exploitation results (created by AI agent)
+- id (string): deterministic ID
+- attack_type (string): "cve_exploit" or "brute_force"
+- severity (string): always "critical"
+- target_ip (string): IP address of exploited target
+- target_port (integer): port number targeted (optional)
+- cve_ids (string[]): CVE IDs exploited (for cve_exploit)
+- metasploit_module (string): Metasploit module used (optional)
+- payload (string): payload used (optional)
+- session_id (integer): Metasploit session ID (optional)
+- username (string): compromised username (for brute_force)
+- password (string): compromised password (for brute_force)
+- report (string): structured exploitation report
+- evidence (string): evidence of success
+- commands_used (string[]): Metasploit commands used
+- created_at (datetime)
+
 ## Relationships (CRITICAL: Direction Matters!)
 
 ### Infrastructure Relationships
@@ -840,6 +859,11 @@ Each node has `user_id` and `project_id` properties for tenant isolation (handle
 - `(v:Vulnerability)-[:HAS_CVE]->(c:CVE)` - Vulnerability has CVE
 - `(c:CVE)-[:HAS_CWE]->(m:MitreData)` - CVE has CWE
 - `(m:MitreData)-[:HAS_CAPEC]->(cap:Capec)` - CWE has CAPEC
+
+### Exploitation Relationships
+- `(ex:Exploit)-[:EXPLOITED_CVE]->(c:CVE)` - Exploit targeted a CVE (for cve_exploit)
+- `(ex:Exploit)-[:TARGETED_IP]->(i:IP)` - Exploit targeted an IP
+- `(ex:Exploit)-[:VIA_PORT]->(p:Port)` - Exploit went through a port (for brute_force)
 
 ## Common Query Patterns
 
@@ -906,6 +930,27 @@ MATCH (i:IP)-[:RESOLVES_TO]->(s)
 MATCH (i)-[:HAS_PORT]->(p:Port)
 WHERE p.state = "open"
 RETURN s.name, i.address, p.number, p.protocol
+```
+
+### Exploitation Results
+```cypher
+// All successful exploits
+MATCH (ex:Exploit)
+RETURN ex.attack_type, ex.target_ip, ex.target_port, ex.severity, ex.evidence
+LIMIT 20
+
+// CVE exploits with targeted CVE details
+MATCH (ex:Exploit)-[:EXPLOITED_CVE]->(c:CVE)
+RETURN ex.target_ip, c.id as cve, ex.metasploit_module, ex.evidence
+
+// Brute force results with credentials
+MATCH (ex:Exploit)
+WHERE ex.attack_type = "brute_force"
+RETURN ex.target_ip, ex.target_port, ex.username, ex.password, ex.evidence
+
+// Exploits targeting a specific IP
+MATCH (ex:Exploit)-[:TARGETED_IP]->(i:IP {{address: "10.0.0.5"}})
+RETURN ex.attack_type, ex.cve_ids, ex.evidence
 ```
 
 ### Counting and Aggregation

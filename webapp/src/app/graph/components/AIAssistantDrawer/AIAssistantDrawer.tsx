@@ -9,7 +9,7 @@
 'use client'
 
 import { useState, useRef, useEffect, useCallback, KeyboardEvent } from 'react'
-import { Send, Bot, User, Loader2, AlertCircle, Sparkles, RotateCcw, Shield, Target, Zap, HelpCircle, WifiOff, Wifi } from 'lucide-react'
+import { Send, Bot, User, Loader2, AlertCircle, Sparkles, RotateCcw, Shield, Target, Zap, HelpCircle, WifiOff, Wifi, Square, Play } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter'
@@ -39,6 +39,7 @@ interface Message {
   error?: string | null
   phase?: Phase
   timestamp: Date
+  isGuidance?: boolean
 }
 
 type ChatItem = Message | ThinkingItem | ToolExecutionItem
@@ -103,6 +104,7 @@ export function AIAssistantDrawer({
   const [chatItems, setChatItems] = useState<ChatItem[]>([])
   const [inputValue, setInputValue] = useState('')
   const [isLoading, setIsLoading] = useState(false)
+  const [isStopped, setIsStopped] = useState(false)
   const [currentPhase, setCurrentPhase] = useState<Phase>('informational')
   const [attackPathType, setAttackPathType] = useState<AttackPathType>('cve_exploit')
   const [iterationCount, setIterationCount] = useState(0)
@@ -173,6 +175,7 @@ export function AIAssistantDrawer({
     setAnswerText('')
     setSelectedOptions([])
     setTodoList([])
+    setIsStopped(false)
     awaitingApprovalRef.current = false
     isProcessingApproval.current = false
     awaitingQuestionRef.current = false
@@ -199,6 +202,7 @@ export function AIAssistantDrawer({
         }
         setChatItems(prev => [...prev, thinkingItem])
         setIsLoading(true)
+        setIsStopped(false)
         break
 
       case MessageType.TOOL_START:
@@ -359,11 +363,20 @@ export function AIAssistantDrawer({
         setChatItems(prev => [...prev, completeMessage])
         setIsLoading(false)
         break
+
+      case MessageType.GUIDANCE_ACK:
+        // Already shown in chat from handleSend
+        break
+
+      case MessageType.STOPPED:
+        setIsLoading(false)
+        setIsStopped(true)
+        break
     }
   }, [todoList])
 
   // Initialize WebSocket
-  const { status, isConnected, reconnectAttempt, sendQuery, sendApproval, sendAnswer } = useAgentWebSocket({
+  const { status, isConnected, reconnectAttempt, sendQuery, sendApproval, sendAnswer, sendGuidance, sendStop, sendResume } = useAgentWebSocket({
     userId: userId || process.env.NEXT_PUBLIC_USER_ID || 'default_user',
     projectId: projectId || process.env.NEXT_PUBLIC_PROJECT_ID || 'default_project',
     sessionId: sessionId || process.env.NEXT_PUBLIC_SESSION_ID || 'default_session',
@@ -388,24 +401,37 @@ export function AIAssistantDrawer({
     const question = inputValue.trim()
     if (!question || !isConnected || awaitingApproval || awaitingQuestion) return
 
-    // Add user message to chat
-    const userMessage: Message = {
-      id: `user-${Date.now()}`,
-      role: 'user',
-      content: question,
-      timestamp: new Date(),
-    }
-    setChatItems(prev => [...prev, userMessage])
-    setInputValue('')
-    setIsLoading(true)
+    if (isLoading) {
+      // Agent is working → send as guidance
+      const guidanceMessage: Message = {
+        id: `guidance-${Date.now()}`,
+        role: 'user',
+        content: question,
+        isGuidance: true,
+        timestamp: new Date(),
+      }
+      setChatItems(prev => [...prev, guidanceMessage])
+      setInputValue('')
+      sendGuidance(question)
+    } else {
+      // Normal query
+      const userMessage: Message = {
+        id: `user-${Date.now()}`,
+        role: 'user',
+        content: question,
+        timestamp: new Date(),
+      }
+      setChatItems(prev => [...prev, userMessage])
+      setInputValue('')
+      setIsLoading(true)
 
-    // Send via WebSocket
-    try {
-      sendQuery(question)
-    } catch (error) {
-      setIsLoading(false)
+      try {
+        sendQuery(question)
+      } catch (error) {
+        setIsLoading(false)
+      }
     }
-  }, [inputValue, isConnected, awaitingApproval, awaitingQuestion, sendQuery])
+  }, [inputValue, isConnected, isLoading, awaitingApproval, awaitingQuestion, sendQuery, sendGuidance])
 
   const handleApproval = useCallback((decision: 'approve' | 'modify' | 'abort') => {
     // Prevent double submission using ref (immediate check, not async state)
@@ -494,6 +520,16 @@ export function AIAssistantDrawer({
     }
   }, [questionRequest, answerText, selectedOptions, sendAnswer, awaitingQuestion])
 
+  const handleStop = useCallback(() => {
+    sendStop()
+  }, [sendStop])
+
+  const handleResume = useCallback(() => {
+    sendResume()
+    setIsStopped(false)
+    setIsLoading(true)
+  }, [sendResume])
+
   const handleKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault()
@@ -519,6 +555,7 @@ export function AIAssistantDrawer({
     setAnswerText('')
     setSelectedOptions([])
     setTodoList([])
+    setIsStopped(false)
     awaitingApprovalRef.current = false
     isProcessingApproval.current = false
     awaitingQuestionRef.current = false
@@ -591,12 +628,15 @@ export function AIAssistantDrawer({
         key={item.id}
         className={`${styles.message} ${
           item.role === 'user' ? styles.messageUser : styles.messageAssistant
-        }`}
+        } ${item.isGuidance ? styles.messageGuidance : ''}`}
       >
         <div className={styles.messageIcon}>
           {item.role === 'user' ? <User size={14} /> : <Bot size={14} />}
         </div>
         <div className={styles.messageContent}>
+          {item.isGuidance && (
+            <span className={styles.guidanceBadge}>Guidance</span>
+          )}
           <div className={styles.messageText}>
             <ReactMarkdown
               remarkPlugins={[remarkGfm]}
@@ -951,22 +991,42 @@ export function AIAssistantDrawer({
                 ? 'Respond to the approval request above...'
                 : awaitingQuestion
                 ? 'Answer the question above...'
+                : isStopped
+                ? 'Agent stopped. Click resume to continue...'
+                : isLoading
+                ? 'Send guidance to the agent...'
                 : 'Ask a question...'
             }
             rows={1}
-            disabled={isLoading || awaitingApproval || awaitingQuestion || !isConnected}
+            disabled={awaitingApproval || awaitingQuestion || !isConnected || isStopped}
           />
-          <button
-            className={styles.sendButton}
-            onClick={handleSend}
-            disabled={!inputValue.trim() || isLoading || awaitingApproval || awaitingQuestion || !isConnected}
-            aria-label="Send message"
-          >
-            {isLoading ? <Loader2 size={13} className={styles.spinner} /> : <Send size={13} />}
-          </button>
+          <div className={styles.inputActions}>
+            {(isLoading || isStopped) && (
+              <button
+                className={`${styles.stopResumeButton} ${isStopped ? styles.resumeButton : styles.stopButton}`}
+                onClick={isStopped ? handleResume : handleStop}
+                aria-label={isStopped ? 'Resume agent' : 'Stop agent'}
+                title={isStopped ? 'Resume execution' : 'Stop execution'}
+              >
+                {isStopped ? <Play size={13} /> : <Square size={13} />}
+              </button>
+            )}
+            <button
+              className={styles.sendButton}
+              onClick={handleSend}
+              disabled={!inputValue.trim() || awaitingApproval || awaitingQuestion || !isConnected || isStopped}
+              aria-label="Send message"
+            >
+              <Send size={13} />
+            </button>
+          </div>
         </div>
         <span className={styles.inputHint}>
-          {isConnected ? 'Press Enter to send, Shift+Enter for new line' : 'Waiting for connection...'}
+          {isConnected
+            ? isLoading
+              ? 'Send guidance or stop the agent'
+              : 'Press Enter to send, Shift+Enter for new line'
+            : 'Waiting for connection...'}
         </span>
       </div>
     </div>

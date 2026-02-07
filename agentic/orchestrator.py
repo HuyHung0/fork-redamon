@@ -5,6 +5,7 @@ ReAct-style agent orchestrator with iterative Thought-Tool-Output pattern.
 Supports phase tracking, LLM-managed todo lists, and checkpoint-based approval.
 """
 
+import asyncio
 import os
 import logging
 from typing import Optional
@@ -106,6 +107,7 @@ class AgentOrchestrator:
 
         self._initialized = False
         self._streaming_callback = None  # Set during invoke_with_streaming
+        self._guidance_queue = None  # Set during invoke_with_streaming
 
     async def initialize(self) -> None:
         """Initialize tools and graph (LLM setup deferred until project_id is known)."""
@@ -508,6 +510,28 @@ class AgentOrchestrator:
             )
             system_prompt = system_prompt + "\n" + output_section
             logger.info(f"[{user_id}/{project_id}/{session_id}] Injected output analysis section for tool: {pending_step.get('tool_name')}")
+
+        # Drain pending guidance messages from user
+        guidance_messages = []
+        if self._guidance_queue:
+            while not self._guidance_queue.empty():
+                try:
+                    guidance_messages.append(self._guidance_queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+
+        if guidance_messages:
+            guidance_section = (
+                "\n\n## USER GUIDANCE (IMPORTANT)\n\n"
+                "The user sent these guidance messages while you were working. "
+                "They refine your CURRENT objective — do NOT treat them as new tasks. "
+                "Adjust your plan and next action accordingly:\n\n"
+            )
+            for i, msg in enumerate(guidance_messages, 1):
+                guidance_section += f"{i}. {msg}\n"
+            guidance_section += "\nAcknowledge this guidance in your thought.\n"
+            system_prompt += guidance_section
+            logger.info(f"[{user_id}/{project_id}/{session_id}] Injected {len(guidance_messages)} guidance messages into prompt")
 
         # Log the full prompt for debugging
         logger.info(f"\n{'#'*80}")
@@ -1426,7 +1450,8 @@ class AgentOrchestrator:
         user_id: str,
         project_id: str,
         session_id: str,
-        streaming_callback
+        streaming_callback,
+        guidance_queue=None
     ) -> InvokeResponse:
         """
         Invoke agent with streaming callbacks for real-time updates.
@@ -1451,8 +1476,9 @@ class AgentOrchestrator:
         self._apply_project_settings(project_id)
         logger.info(f"[{user_id}/{project_id}/{session_id}] Invoking with streaming: {question[:10000]}")
 
-        # Store streaming callback for use in _execute_tool_node
+        # Store streaming callback and guidance queue for use in nodes
         self._streaming_callback = streaming_callback
+        self._guidance_queue = guidance_queue
 
         try:
             config = create_config(user_id, project_id, session_id)
@@ -1484,7 +1510,8 @@ class AgentOrchestrator:
             await streaming_callback.on_error(str(e), recoverable=False)
             return InvokeResponse(error=str(e))
         finally:
-            self._streaming_callback = None  # Clear callback after execution
+            self._streaming_callback = None
+            self._guidance_queue = None
 
     async def resume_after_approval_with_streaming(
         self,
@@ -1493,7 +1520,8 @@ class AgentOrchestrator:
         project_id: str,
         decision: str,
         modification: Optional[str],
-        streaming_callback
+        streaming_callback,
+        guidance_queue=None
     ) -> InvokeResponse:
         """Resume after approval with streaming callbacks."""
         if not self._initialized:
@@ -1502,8 +1530,9 @@ class AgentOrchestrator:
         self._apply_project_settings(project_id)
         logger.info(f"[{user_id}/{project_id}/{session_id}] Resuming with streaming approval: {decision}")
 
-        # Store streaming callback for use in _execute_tool_node
+        # Store streaming callback and guidance queue for use in nodes
         self._streaming_callback = streaming_callback
+        self._guidance_queue = guidance_queue
 
         try:
             config = create_config(user_id, project_id, session_id)
@@ -1543,7 +1572,8 @@ class AgentOrchestrator:
             await streaming_callback.on_error(str(e), recoverable=False)
             return InvokeResponse(error=str(e))
         finally:
-            self._streaming_callback = None  # Clear callback after execution
+            self._streaming_callback = None
+            self._guidance_queue = None
 
     async def resume_after_answer_with_streaming(
         self,
@@ -1551,7 +1581,8 @@ class AgentOrchestrator:
         user_id: str,
         project_id: str,
         answer: str,
-        streaming_callback
+        streaming_callback,
+        guidance_queue=None
     ) -> InvokeResponse:
         """Resume after answer with streaming callbacks."""
         if not self._initialized:
@@ -1560,8 +1591,9 @@ class AgentOrchestrator:
         self._apply_project_settings(project_id)
         logger.info(f"[{user_id}/{project_id}/{session_id}] Resuming with streaming answer: {answer[:10000]}")
 
-        # Store streaming callback for use in _execute_tool_node
+        # Store streaming callback and guidance queue for use in nodes
         self._streaming_callback = streaming_callback
+        self._guidance_queue = guidance_queue
 
         try:
             config = create_config(user_id, project_id, session_id)
@@ -1600,7 +1632,60 @@ class AgentOrchestrator:
             await streaming_callback.on_error(str(e), recoverable=False)
             return InvokeResponse(error=str(e))
         finally:
-            self._streaming_callback = None  # Clear callback after execution
+            self._streaming_callback = None
+            self._guidance_queue = None
+
+    async def resume_execution_with_streaming(
+        self,
+        user_id: str,
+        project_id: str,
+        session_id: str,
+        streaming_callback,
+        guidance_queue=None
+    ) -> InvokeResponse:
+        """Resume execution from last checkpoint (after stop)."""
+        if not self._initialized:
+            raise RuntimeError("Orchestrator not initialized. Call initialize() first.")
+
+        self._apply_project_settings(project_id)
+        logger.info(f"[{user_id}/{project_id}/{session_id}] Resuming execution from checkpoint")
+
+        self._streaming_callback = streaming_callback
+        self._guidance_queue = guidance_queue
+
+        try:
+            config = create_config(user_id, project_id, session_id)
+
+            current_state = await self.graph.aget_state(config)
+            if not current_state or not current_state.values:
+                await streaming_callback.on_error("No session state to resume", recoverable=False)
+                return InvokeResponse(error="No session state to resume")
+
+            # Re-invoke graph from last checkpoint with empty input
+            final_state = None
+            async for event in self.graph.astream({}, config, stream_mode="values"):
+                final_state = event
+                await self._emit_streaming_events(event, streaming_callback)
+
+            if final_state:
+                response = self._build_response(final_state)
+                await streaming_callback.on_response(
+                    response.answer,
+                    response.iteration_count,
+                    response.current_phase,
+                    response.task_complete
+                )
+                return response
+            else:
+                raise RuntimeError("No final state returned")
+
+        except Exception as e:
+            logger.error(f"[{user_id}/{project_id}/{session_id}] Resume execution error: {e}")
+            await streaming_callback.on_error(str(e), recoverable=False)
+            return InvokeResponse(error=str(e))
+        finally:
+            self._streaming_callback = None
+            self._guidance_queue = None
 
     async def _emit_streaming_events(self, state: dict, callback):
         """Emit appropriate streaming events based on state changes."""
