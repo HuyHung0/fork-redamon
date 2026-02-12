@@ -38,9 +38,12 @@ RUN apt-get install -y --fix-missing \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Go (required for naabu and nuclei)
-RUN wget -q https://go.dev/dl/go1.21.5.linux-amd64.tar.gz \
-    && tar -C /usr/local -xzf go1.21.5.linux-amd64.tar.gz \
-    && rm go1.21.5.linux-amd64.tar.gz
+# Handle ARM64 (Apple Silicon) vs AMD64 automatically
+RUN ARCH=$(dpkg --print-architecture) && \
+    if [ "$ARCH" = "arm64" ]; then GO_ARCH="arm64"; else GO_ARCH="amd64"; fi && \
+    wget -q https://go.dev/dl/go1.25.7.linux-$GO_ARCH.tar.gz && \
+    tar -C /usr/local -xzf go1.25.7.linux-$GO_ARCH.tar.gz && \
+    rm go1.25.7.linux-$GO_ARCH.tar.gz
 
 ENV PATH="${PATH}:/usr/local/go/bin:/root/go/bin"
 ENV GOPATH="/root/go"
