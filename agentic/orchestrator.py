@@ -95,6 +95,7 @@ class AgentOrchestrator:
         """Initialize the orchestrator with configuration."""
         self.openai_api_key = os.getenv("OPENAI_API_KEY")
         self.anthropic_api_key = os.getenv("ANTHROPIC_API_KEY")
+        self.anthropic_base_url = os.getenv("ANTHROPIC_BASE_URL")
         self.neo4j_uri = os.getenv("NEO4J_URI", "bolt://localhost:7687")
         self.neo4j_user = os.getenv("NEO4J_USER", "neo4j")
         self.neo4j_password = os.getenv("NEO4J_PASSWORD")
@@ -126,7 +127,7 @@ class AgentOrchestrator:
     def _apply_project_settings(self, project_id: str) -> None:
         """Load project settings from webapp API and reconfigure LLM if model changed."""
         settings = load_project_settings(project_id)
-        new_model = settings.get('OPENAI_MODEL', 'gpt-5.2')
+        new_model = settings.get('OPENAI_MODEL', os.getenv('LLM_MODEL', 'gpt-5.2'))
 
         if new_model != self.model_name:
             logger.info(f"Model changed: {self.model_name} -> {new_model}")
@@ -142,16 +143,22 @@ class AgentOrchestrator:
         logger.info(f"Setting up LLM: {self.model_name}")
 
         if self.model_name.startswith("claude-"):
-            if not self.anthropic_api_key:
+            api_key = self.anthropic_api_key
+            if self.anthropic_base_url:
+                api_key = api_key or "dummy"
+            if not api_key:
                 raise ValueError(
                     f"ANTHROPIC_API_KEY environment variable is required for model '{self.model_name}'"
                 )
-            self.llm = ChatAnthropic(
+            kwargs = dict(
                 model=self.model_name,
-                api_key=self.anthropic_api_key,
+                api_key=api_key,
                 temperature=0,
                 max_tokens=4096,
             )
+            if self.anthropic_base_url:
+                kwargs["base_url"] = self.anthropic_base_url
+            self.llm = ChatAnthropic(**kwargs)
         else:
             if not self.openai_api_key:
                 raise ValueError(

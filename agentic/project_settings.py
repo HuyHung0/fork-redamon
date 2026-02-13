@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_AGENT_SETTINGS: dict[str, Any] = {
     # LLM Configuration
-    'OPENAI_MODEL': 'gpt-5.2',
+    'OPENAI_MODEL': os.getenv('LLM_MODEL', 'gpt-5.2'),
     'INFORMATIONAL_SYSTEM_PROMPT': '',
     'EXPL_SYSTEM_PROMPT': '',
     'POST_EXPL_SYSTEM_PROMPT': '',
